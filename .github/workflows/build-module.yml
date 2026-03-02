@@ -80,16 +80,25 @@ jobs:
       - name: Download and extract ImmortalWrt SDK
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
-          # Исправлена ссылка: добавлен /releases/ и правильный домен
-          SDK_FILE=$(curl -s "https://downloads.immortalwrt.org{{ matrix.build_env.tag }}/targets/${{ matrix.build_env.target}}/${{ matrix.build_env.subtarget}}/" | grep -o "immortalwrt-sdk-${{ matrix.build_env.tag }}-${{ matrix.build_env.target}}-${{ matrix.build_env.subtarget}}_gcc-[^\"]*_musl[^\"]*\.Linux-x86_64\.tar\.[xz|zst]*" | head -n1)
+          # Исправленная ссылка: добавлен /releases/ и корректная переменная ${{ ... }}
+          BASE_URL="https://downloads.immortalwrt.org{{ matrix.build_env.tag }}/targets/${{ matrix.build_env.target }}/${{ matrix.build_env.subtarget }}/"
+          
+          # Поиск файла SDK
+          SDK_FILE=$(curl -s "$BASE_URL" | grep -oE "immortalwrt-sdk-[a-zA-Z0-9._-]+\.Linux-x86_64\.tar\.(xz|zst)" | head -n1)
           
           if [ -z "$SDK_FILE" ]; then
-            echo "SDK file not found"
+            echo "SDK file not found at $BASE_URL"
             exit 1
           fi
           
-          wget "https://downloads.immortalwrt.org{{ matrix.build_env.tag }}/targets/${{ matrix.build_env.target}}/${{ matrix.build_env.subtarget}}/${SDK_FILE}"
-          tar -xf "$SDK_FILE"
+          echo "Found SDK: $SDK_FILE"
+          wget "${BASE_URL}${SDK_FILE}"
+          
+          if [[ "$SDK_FILE" == *.tar.zst ]]; then
+            tar --zstd -xf "$SDK_FILE"
+          else
+            tar -xf "$SDK_FILE"
+          fi
           rm "$SDK_FILE"
 
       - name: Setup SDK and feeds
