@@ -1,65 +1,207 @@
-name: Build AmneziaWG for Cudy TR3000 (ImmortalWrt 24.10.5)
+name: Create Release on Tag
 
 on:
-  workflow_dispatch: # Позволяет запускать сборку вручную
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'OpenWRT version (e.g., 24.10.5)'
+        required: true
+        type: string
+      targets:
+        description: 'Targets (comma-separated, optional)'
+        required: false
+        type: string
+      subtargets:
+        description: 'Subtargets (comma-separated, optional)'
+        required: false
+        type: string
+
 
 jobs:
-  build:
+  generate-config:
     runs-on: ubuntu-latest
+    outputs:
+      job-config: ${{ steps.generate-config.outputs.job-config }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.16.0'
+
+      - name: Get OpenWRT version from inputs or tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ inputs.version }}" >> $GITHUB_ENV
+
+            if [ -n "${{ inputs.targets }}" ]; then
+              echo "TARGETS=${{ inputs.targets }}" >> $GITHUB_ENV
+            fi
+
+            if [ -n "${{ inputs.subtargets }}" ]; then
+              echo "SUBTARGETS=${{ inputs.subtargets }}" >> $GITHUB_ENV
+            fi
+
+          elif [ "${{ github.event_name }}" = "workflow_call" ]; then
+            echo "VERSION=${{ inputs.tag_name }}" >> $GITHUB_ENV
+
+          else
+            echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> $GITHUB_ENV
+          fi
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate Job Config
+        id: generate-config
+        run: node index.js ${{ env.VERSION }} "${{ env.TARGETS }}" "${{ env.SUBTARGETS }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: "v${{ matrix.build_env.tag }} - ${{ matrix.build_env.pkgarch}} :: ${{ matrix.build_env.target}}/${{ matrix.build_env.subtarget}} build"
+    runs-on: ubuntu-latest
+    needs: generate-config
+    strategy:
+      matrix:
+        build_env: ${{ fromJson(needs.generate-config.outputs.job-config) }}
+      fail-fast: false
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout AWG source code
+        uses: actions/checkout@v4
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev file wget curl
+      - name: Install Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pyelftools
 
-    - name: Download and extract ImmortalWrt SDK
-      run: |
-        # Точная ссылка на SDK 24.10.5 для Mediatek Filogic
-        SDK_URL="https://downloads.immortalwrt.org/releases/24.10.5/targets/mediatek/filogic/immortalwrt-sdk-24.10.5-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.xz"
-        wget -O sdk.tar.xz $SDK_URL
-        tar -xf sdk.tar.xz
-        mv immortalwrt-sdk-* sdk_dir
+      - name: Cache ImmortalWrt SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        env:
+          cache-name: "cache-sdk-${{ matrix.build_env.tag }}-${{ matrix.build_env.target}}-${{ matrix.build_env.subtarget}}"
+        with:
+          path: openwrt-sdk-*/
+          key: ${{ runner.os }}-sdk-${{ env.cache-name }}
 
-    - name: Update feeds and add AmneziaWG source
-      run: |
-        cd sdk_dir
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
-        
-        # Клонируем форк AWG
-        git clone https://github.com/Slava-Shchipunov/awg-openwrt.git package/amneziawg
+      - name: Download and extract ImmortalWrt SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          echo "pkgarch: ${{ matrix.build_env.pkgarch}}, target:${{ matrix.build_env.target}}, subtarget: ${{ matrix.build_env.subtarget}}"
 
-    - name: Configure and build packages
-      run: |
-        cd sdk_dir
-        
-        # Генерируем стандартный конфиг SDK
-        make defconfig
-        
-        # Принудительно включаем пакеты AWG как модули (m)
-        echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
-        echo "CONFIG_PACKAGE_amneziawg-tools=m" >> .config
-        echo "CONFIG_PACKAGE_luci-proto-amneziawg=m" >> .config
-        
-        # Применяем новые настройки
-        make defconfig
-        
-        # Собираем AWG с использованием всех доступных ядер процессора (-j)
-        make package/amneziawg/compile V=s -j$(nproc)
+          # Get the actual SDK filename from the directory listing
+          SDK_FILE=$(curl -s "https://downloads.immortalwrt.org/releases/${{ matrix.build_env.tag }}/targets/${{ matrix.build_env.target}}/${{ matrix.build_env.subtarget}}/" | grep -o "openwrt-sdk-${{ matrix.build_env.tag }}-${{ matrix.build_env.target}}-${{ matrix.build_env.subtarget}}_gcc-[^\"]*_musl[^\"]*\.Linux-x86_64\.tar\.[xz|zst]*" | head -n1)
+          
+          if [ -z "$SDK_FILE" ]; then
+            echo "SDK file not found for ${{ matrix.build_env.tag }} ${{ matrix.build_env.target}} ${{ matrix.build_env.subtarget}}"
+            exit 1
+          fi
+          
+          SDK_DOWNLOAD_URL="https://downloads.immortalwrt.org/releases/${{ matrix.build_env.tag }}/targets/${{ matrix.build_env.target}}/${{ matrix.build_env.subtarget}}/${SDK_FILE}"
+          echo "Downloading SDK: $SDK_DOWNLOAD_URL"
+          
+          wget "$SDK_DOWNLOAD_URL"
+          
+          # Extract based on file extension
+          if [[ "$SDK_FILE" == *.tar.zst ]]; then
+            tar --zstd -xf "$SDK_FILE"
+          elif [[ "$SDK_FILE" == *.tar.xz ]]; then
+            tar -xf "$SDK_FILE"
+          else
+            echo "Unknown archive format: $SDK_FILE"
+            exit 1
+          fi
+          
+          rm "$SDK_FILE"
 
-    - name: Collect IPK files
-      run: |
-        mkdir -p awg-packages
-        # Ищем все собранные файлы .ipk, содержащие в названии amneziawg
-        find sdk_dir/bin/ -type f -name "*amneziawg*.ipk" -exec cp {} awg-packages/ \;
+      - name: Setup SDK and feeds
+        run: |
+          # Find SDK directory
+          SDK_DIR=$(find . -maxdepth 1 -name "openwrt-sdk-*" -type d | head -n1)
+          
+          if [ -z "$SDK_DIR" ]; then
+            echo "SDK directory not found"
+            exit 1
+          fi
+          
+          # Get absolute paths
+          WORKSPACE_DIR=$(pwd)
+          
+          cd "$SDK_DIR"
+          
+          # Update feeds to include LuCI
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          
+          # Copy current repository packages directly to package directory
+          cp -r "$WORKSPACE_DIR/kmod-amneziawg" package/
+          cp -r "$WORKSPACE_DIR/amneziawg-tools" package/
+          cp -r "$WORKSPACE_DIR/luci-proto-amneziawg" package/
+          
+          # Configure packages to build
+          echo "CONFIG_PACKAGE_kmod-amneziawg=m" > .config
+          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y" >> .config
+          
+          make defconfig
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: amneziawg-immortalwrt-24.10.5-cudy-tr3000
-        path: awg-packages/*.ipk
-        retention-days: 7
+      - name: Build AmneziaWG packages
+        run: |
+          # Find SDK directory
+          SDK_DIR=$(find . -maxdepth 1 -name "immortalwrt-sdk-*" -type d | head -n1)
+          cd "$SDK_DIR"
+
+          echo "Building AmneziaWG packages..."
+
+          # Build kmod-amneziawg (kernel module)
+          echo "Building kmod-amneziawg..."
+          make package/kmod-amneziawg/{download,prepare} V=s || true
+          make package/kmod-amneziawg/compile V=s || true
+
+          # Build luci-proto-amneziawg (web interface)
+          echo "Building luci-proto-amneziawg..."
+          make package/luci-proto-amneziawg/{download,prepare} V=s
+          make package/luci-proto-amneziawg/compile V=s
+
+          # Build amneziawg-tools (userspace tools)
+          echo "Building amneziawg-tools..."
+          make package/amneziawg-tools/{download,prepare} V=s
+          make package/amneziawg-tools/compile V=s
+          
+          echo "Build completed. Checking for built packages..."
+          find bin/ -name "*.ipk" | grep -E "(amneziawg|luci-proto-amneziawg|luci-i18n-amneziawg)" | head -10
+
+      - name: Prepare artifacts
+        run: |
+          # Find SDK directory
+          SDK_DIR=$(find . -maxdepth 1 -name "immortalwrt-sdk-*" -type d | head -n1)
+          
+          mkdir -p awgrelease
+          postfix="v${{ matrix.build_env.tag }}_${{ matrix.build_env.pkgarch}}_${{ matrix.build_env.target}}_${{ matrix.build_env.subtarget}}"
+          
+          # Copy built packages
+          find "$SDK_DIR/bin/packages" -name "amneziawg-tools_*.ipk" -exec cp {} awgrelease/amneziawg-tools_${postfix}.ipk \; || echo "amneziawg-tools package not found"
+          find "$SDK_DIR/bin/packages" -name "luci-proto-amneziawg_*.ipk" -exec cp {} awgrelease/luci-proto-amneziawg_${postfix}.ipk \; || echo "luci-proto-amneziawg package not found"
+          find "$SDK_DIR/bin/packages" -name "luci-i18n-amneziawg-ru_*.ipk" -exec cp {} awgrelease/luci-i18n-amneziawg-ru_${postfix}.ipk \; || echo "luci-i18n-amneziawg-ru package not found"
+          find "$SDK_DIR/bin/targets" -name "kmod-amneziawg_*.ipk" -exec cp {} awgrelease/kmod-amneziawg_${postfix}.ipk \; || echo "kmod-amneziawg package not found"
+          
+          echo "Built packages:"
+          ls -la awgrelease/
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: awgrelease/*.ipk
+          tag_name: v${{ matrix.build_env.tag }}
